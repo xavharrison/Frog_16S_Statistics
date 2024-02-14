@@ -1,0 +1,551 @@
+---
+title: "MSc Pathogen Evolution Microbiome Statistics"
+author: "Xav Harrison"
+date: "2022-11-02"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction 
+Here we continue from on from the Bioinformatics element of the workflow in Part 1. We load in the phyloseq object we made in Part 1, which contains our sequences (ASVs), their taxonomic assignments, their phylogenetic relationships (tree), and the sample metadata that decodes which individual is from which population, as well as individual level trait data like mass etc. 
+
+## Libraries 
+Packages we'll need for all the stats
+```{r}
+
+  library(phyloseq) #microbiome data handling
+  library(ggplot2) #plotting 
+  library(dplyr) # data handling  
+  library(vegan) #plotting of community data like bacterial microbiomes and statistical models
+  library(decontam) #identifying contaminants in our sequencing workflow 
+  library(microbiome) # microbiome plotting and convenience functions
+  library(ggordiplots) # tidyverse versions of the vegan plots 
+  library(MASS) #generalized linear models of pathogen infection data (Negative Binomial Error Structure)
+  library(pheatmap) #pretty heatmaps
+  library(RColorBrewer) #Add Custom Colours (e.g. Colour Blind Friendy) 
+  library(MuMIn)
+      
+```
+
+## Global Plotting Options 
+Quick access options for output graphics to make legends and axis labels larger / more legible
+
+```{r}
+
+#Global Plot Options
+            plotopts<- theme(axis.text=element_text(size=20),axis.title=element_text(size=22),strip.text=element_text(size=22),legend.title = element_text(size=20),legend.text = element_text(size=20)) 
+```
+
+## Our Data
+Load in Our Phyloseq Object
+```{r}
+
+load('Frog_Spatial_Phyloseq.RData')
+```
+
+### Interacting with Phyloseq Objects
+Note the unique way of accessing the different elements of the phyloseq object. The three commands are:
+
+```
+Sample Data:    sample_data(ps)
+Taxonomy:       tax_table(ps)
+ASV Matrix      otu_table(ps)
+```
+Note how even though we're using ASVs, phyloseq still refers to them as OTUs in the abundance matrix. 
+
+```{r}
+head(otu_table(ps))
+
+```
+
+## Data Cleaning 
+Here we do some basic cleaning of the data - removing ASVs with no Phylum assignment (probably junk), remove any Chloroplasts (sneaky Cyanobacteria) that have made it through the pipeline, and then any Archaea that also amplify at the 16S locus we chose. 
+```{r}
+
+#Prune Taxa With No Phylum Assignment 
+  ps_prune<-prune_taxa(as.vector(!is.na(tax_table(ps)[,2])),ps)
+  ntaxa(ps)-ntaxa(ps_prune) #82 lost
+
+#Prune Chloroplasts
+  ps_prune_nochloro<-prune_taxa(as.vector(tax_table(ps_prune)[,3]!="Chloroplast"),ps_prune)
+  ntaxa(ps_prune)-ntaxa(ps_prune_nochloro) #266 lost
+
+#How Many Archaea?
+  sum(as.vector(tax_table(ps_prune_nochloro)[,1]=="Archaea")) 
+  
+#Remove Archaea 
+  ps_prune_nochloro_noarchaea<-prune_taxa(as.vector(tax_table(ps_prune_nochloro)[,1]!="Archaea"),ps_prune_nochloro)
+    ntaxa(ps_prune_nochloro_noarchaea)-ntaxa(ps_prune_nochloro) 
+
+```
+
+## Identifying and Removing Decontaminants
+
+It's worth noting here that how to deal with negative contamination is a contentious issue. One strategy is to simply remove any sequence that popped up in the negative controls from ALL samples. This is intuitive and has the advantage of being objective, but sometimes you can pick up extremely low abundance sequences that are  highly abundant in other samples - suggesting some nefarious aerosol of DNA contaminated the negative from a real sample. Noah Fierer and co. [have written a blog on sources of contamination and how to deal with them](http://fiererlab.org/2018/08/15/garbage-in-garbage-out-wrestling-with-contamination-in-microbial-sequencing-projects/)
+
+Here we'll use the R package _decontam_ to identify and remove negative contaminants based on their prevalence and abundance in negative controls versus 'real' samples. First we need a new variale that flags which sample(s) are negatives. It is not uncommon to have multiple negatives in these workflows - one for each extraction plate, PCR plate etc. 
+
+```{r}
+
+## Flag Negatives
+  sample_data(ps_prune_nochloro_noarchaea)$is_negative<- sample_data(ps_prune_nochloro)$SAMPLE.TYPE=="NegativeControl"
+
+##Inspect Library SIzes
+  df <- as.data.frame(sample_data(ps_prune_nochloro_noarchaea)) # Put sample_data into a ggplot-friendly data.frame
+  df$LibrarySize <- sample_sums(ps_prune_nochloro_noarchaea)
+  df <- df[order(df$LibrarySize),]
+  df$Index <- seq(nrow(df))
+  ggplot(data=df, aes(x=Index, y=LibrarySize, color=is_negative)) + geom_point()
+
+```
+
+
+Now we identify contaminants based on their prevalence. The key variable here is "*threshold* which will define how strict our identification is. From the help file:
+
+```
+THRESHOLD: The probability threshold below which (strictly less than) the null-hypothesis (not a contaminant) should be rejected in favor of the alternate hypothesis (contaminant). 
+```
+
+```{r}
+#Negatives Based on Prevalence // Threshold 0.5
+  contamdf.prev <- isContaminant(ps_prune_nochloro_noarchaea, method="prevalence", neg="is_negative",threshold=0.5)
+  table(contamdf.prev$contaminant)
+
+#Plot 
+  ps.pa <- transform_sample_counts(ps_prune_nochloro_noarchaea, function(abund) 1*(abund>0))
+  ps.pa.neg <- prune_samples(sample_data(ps.pa)$is_negative == TRUE, ps.pa)
+  ps.pa.pos <- prune_samples(sample_data(ps.pa)$is_negative == FALSE, ps.pa)
+  # Make data.frame of prevalence in positive and negative samples
+  df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+  ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+    xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+
+####### PRUNE OUT
+  ps_clean<-prune_taxa(contamdf.prev$contaminant==FALSE,ps_prune_nochloro_noarchaea)
+
+
+######## FILTER OUT POSITIVES
+  #ps_clean_positives<-prune_samples(sample_data(ps_clean)$SAMPLE.TYPE=="Positive_Control",ps_clean)
+
+######### SUBSET TO ONLY FROGS 
+  ps_clean_samples<-prune_samples(sample_data(ps_clean)$SAMPLE.TYPE %in% c("FROG"),ps_clean) 
+  ps_clean_samples #check what we're left with 
+  
+```
+
+## Assessing Post-QC Sample Coverage and Library Sizes
+  
+  Now that we've done that, we can check what our post-QC library sizes are. It's a good idea to report these in manuscripts and thesis chapters. Here was ask what the minimum, maximum and mean library sizes-per-samples are. 
+  
+
+```{r}
+ ############## POST QC LIBRARY SIZES
+      
+      ###############
+      # Post-QC Library Stats
+      ###############
+      
+      mean(sample_sums(ps_clean_samples))
+      range(sample_sums(ps_clean_samples))
+```      
+      
+We might be interested in checking that our per-group coverage is roughly equal. Lack of equal coverage might occur if a partocular subset of samples amplify poorly and are hard to pool at the same concentration as other samples. They might be older samples, or from a different sampling location, that systematically exhibit lower coverage. We've had reviewers ask for these checks before, so it might be wise to do them as a matter of course.  
+
+```{r}      
+      #Make a data frame of read depths
+        frog_reads<-data.frame(reads=sample_sums(ps_clean_samples))
+        
+      #Add on the sample ID
+        frog_reads$sample<-rownames(frog_reads)
+        
+      #Join on the Metadata
+        frog_meta<-as(sample_data(ps_clean_samples),"data.frame")
+        frog_reads<-left_join(frog_reads,frog_meta,"sample")
+      
+      #Some Boxplots of Coverage by Population using ggplot2
+            ggplot(frog_reads,aes(x=SITE,y=reads)) + geom_boxplot()
+
+```
+
+# ANALYSIS 
+
+## Rarefaction Curves
+Rarefaction curves allow us to assess whether we've likely discovered all the microbial 'species' / ASVs in a sample. The lower the true species diversity, and the higher the sampling depth (number of reads), the more likely we are to have saturated our species discovery curves. We can plot per-sample rates of species discovery using the 'rarecurve' function in vegan. By default this will plot a different line for each sample, so if you have hundreds of samples, these graphs can look very cluttered!
+
+```{r}
+  #Strip Out the OTU Table
+    ps_clean_otutable<-as(t(otu_table(ps_clean_samples)),"matrix")
+
+  #Rarefaction Curves
+    rarecurve(ps_clean_otutable,step=50)
+
+```
+
+
+## Rarefying Samples
+Ok - now we're ready to do some calculations. But first, we need to remove any artefacts caused by uneven sampling depth across samples, using the command rarefy_even_depth. The rarefaction curves above should convince us *where* we can subsample data to (in 000s of reads) without losing information about community composition. 
+
+This command will automatically rarefy to the lowest-coverage sample sampling depth if you do not specify a sampling depth. This means you won't lose any samples, but could potentially throw away lots of data if there's a single library that amplified poorly. 
+  
+  What is _super important_ is that you specify a random number seed. This is because the rarefying step is based on a random subsample of each library, and providing a random number seed means your analysis will be completely reproducible (rather than differing every tme because of sampling error)
+ 
+```{r}
+     ####### Rarefying Samples
+        
+        #remind ourselves what the minimum coverage ius 
+          min(sample_sums(ps_clean_samples))
+        
+    # Rarefy to lowest library size, set random number see for reproducibility
+        ps_rare<-rarefy_even_depth(ps_clean_samples,rngseed = 150517)
+  
+```
+
+We can rarefy to custom depths as well, but will get warnings if we set the value too high and lose samples with lower depth of coverage
+
+```{r}
+      # Rarefy to custom depth
+        ps_rare_custom<-rarefy_even_depth(ps_clean_samples,sample.size=15000,rngseed = 150517)
+        
+```
+
+Note how we get helpful warnings about which samples we lost, and also which sequences we lost because they were found only in those samples. Again this demonstrates how phyloseq operates on the whole phyloseq object and how all the tables within an object are linked. 
+
+## Alpha Diversity
+Now we want to now the Richness/Diversity of our samples. _phyloseq_ has many built in metrics, all of which differ in the assumptions they make about the data & what they are measuring e.g. pure richness (Observed), or richness weighted by evenness (Shannon)
+  
+  
+It's important to note that these metrics will all be correlated because they all measure similar things. Some papers will report tests on multiple alpha diversity values, but this arguably exposes them to multiple testing issues - that is increased risk of finding a false positive by asking the same statistical question over and over. 
+   
+   
+
+```{r}
+
+#Estimate Observed RIchness and Shannon Diversity
+  frog_rich<-estimate_richness(ps_rare,measures=c('Shannon','Observed'))
+
+#Add On Sample metadata
+  frog_rich$sample<-rownames(frog_rich)
+  frog_rich<-left_join(frog_rich,frog_meta,"sample")
+
+```
+
+### Does Richness Vary By Site?
+
+```{r}
+site_richness1<-ggplot(frog_rich,aes(y=Observed,x=SITE)) + geom_violin(aes(fill=SITE)) + plotopts
+site_richness1 + guides(fill="none")
+```
+
+### Does Microbiome Diversity Predict Infection Burden? (And Does This Vary By Site?)
+
+```{r}
+
+rich_pathogen_plot1<-ggplot(frog_rich,aes(x=Observed,y=pathogen_GE,group=SITE)) + geom_point(size=5,shape=21,aes(fill=SITE))  + geom_smooth(method="lm")
+rich_pathogen_plot1 + labs(y="Bd Infection (Genomic Equivalents)",x="Observed Bacterial Diversity") + plotopts
+
+
+```
+
+### A Model of Microbiome Diversity as a Predictor of Infection Load
+
+```{r}
+
+#Model (uses the MASS library)
+  m1<-glm.nb(pathogen_GE ~ Observed*SITE ,data=frog_rich)
+  summary(m1)
+  
+#Model Selection using AIC
+  m1_nointeraction<-update(m1,~.-Observed:SITE)
+  m1_obs<-glm.nb(pathogen_GE ~ Observed,data=frog_rich)
+  m1_site<-glm.nb(pathogen_GE ~ SITE ,data=frog_rich)
+  m1_null<-glm.nb(pathogen_GE ~ 1,data=frog_rich)
+  
+  #Build The AICc table
+    model.sel(m1,m1_nointeraction,m1_obs,m1_site,m1_null)
+    
+
+```
+
+### For those of us more comfortable with a frequentist approach 
+A plea to never use BOTH AIC and p values. This is just to show how our inference may or may not change depending on your statistical worldview. 
+```{r}
+
+  #A Likelihood Ratio Test of the Interaction 
+    anova(m1,m1_nointeraction)
+```
+
+### Does Pathogen Load Correlate With Mortality?
+
+```{r}
+
+# Model - Is Mortality a Function of Pathogen Load
+mortality_model1<-glm(mortality ~ pathogen_GE,family=binomial,data=frog_rich)
+summary(mortality_model1)
+
+
+```
+
+
+## BETA DIVERSITY
+
+## Barplots of Community Structure
+We can summarise our microbial communities using compositional barplots, which provide a quick and accessible way of visualising differences in taxonomy at different hierarchies. 
+
+The first step here is to remove samples in our phyloseq object with low reads, otherwise this will break our averaging
+
+```{r}
+
+#Filter Samples With No Data
+  physeq_subset<-prune_samples(sample_sums(ps_rare)>0,ps_rare)
+
+```
+
+### Using All The Data
+Next we tell phyloseq to aggregate reads at the taxonomic level of interest - here Phylum - and to transform the data to relative abundance (fraction of reads, rather than count of reads)
+```{r}
+
+#Aggregate To Phylum Level and Transform to Relative Abundance  
+    physeq_phylum <- physeq_subset %>%
+        aggregate_taxa(level = "Phylum") %>%  
+      microbiome::transform(transform = "compositional")
+    
+
+```
+
+Now we have some choices. We can plot the data with a bar for each sample:
+
+```{r}
+
+#Plot Composition By Sample ID    
+physeq_sample_plot <- physeq_phylum %>%
+  plot_composition(sample.sort = "Proteobacteria")
+physeq_sample_plot
+
+```
+
+Or Average By metadata of interest - perhaps we just want to look at average structure by SITE ID?
+
+```{r}
+
+#Plot Composition Grouped By Sample Metadata
+physeq_grouped_plot <- physeq_phylum %>%
+  plot_composition(sample.sort = "Proteobacteria", average_by = "SITE")
+physeq_grouped_plot  
+```
+
+### Top N Approach
+The plots can get quite messy - so it's not uncommon to just subset to the top 'N' of a taxonomic group for easier visualisation 
+
+```{r}
+
+#What Are the Names of the most abundant phyla?  
+  physeq_phylumcollapse<- physeq_subset %>% aggregate_taxa(level="Phylum")
+  physeq_top5phyla = names(sort(taxa_sums(physeq_phylumcollapse), TRUE)[1:5])
+  physeq_top5phyla
+
+#Subset the phyloseq object to those phyla   
+  physeq_top5phylum_filter<-subset_taxa(physeq_subset,Phylum %in% physeq_top5phyla)
+
+#Remake Our Graph  but with no grouping (samples)
+physeq_top5phylum_samples_plot <- physeq_top5phylum_filter %>%
+  aggregate_taxa(level = "Phylum") %>%  
+  microbiome::transform(transform = "compositional") %>%
+  plot_composition(sample.sort = "Proteobacteria")
+physeq_top5phylum_samples_plot  
+
+#Remake Our Graph  but with averaging by SITE
+  physeq_top5phylum_site_plot <- physeq_top5phylum_filter %>%
+    aggregate_taxa(level = "Phylum") %>%  
+    microbiome::transform(transform = "compositional") %>%
+    plot_composition(sample.sort = "Proteobacteria", average_by = "SITE")
+  physeq_top5phylum_site_plot
+
+
+```
+
+### Barplot with Custom Colours in RColorBrewer
+
+```{r}
+### Add Custom Colours (e.g. Colour Blind Friendy) 
+    physeq_top5phylum_site_plot + scale_fill_brewer(palette="Set2")  
+
+#All The CBF palettes in RColorBrewer  
+    display.brewer.all(colorblindFriendly = T)
+
+```
+
+## Heatmaps
+### Heatmaps in _phyloseq_
+```{r}
+
+#####  HEATMAP (baked into phyloseq)
+
+    #Subset to Most 50 abundant OTUs
+     ps_rare_top50 <- prune_taxa(names(sort(taxa_sums(ps_rare),TRUE)[1:50]), ps_rare)
+    
+    #Plot Heatmap with X axis ordered Inter-Sample Distance    
+      plot_heatmap(ps_rare_top50,"NMDS",distance = "bray")  
+    
+    #And again, with explicit ordering of samples by SITE
+      plot_heatmap(ps_rare_top50,"NMDS",distance = "bray",sample.label="SITE",sample.order = "SITE")  
+
+```
+
+
+### Other Heatmaps (pheatmap)
+There are plenty of heatmap packages in R, and one I quite like is the _pheatmap_ package. It allows you to annotate the heatmaps with useful metadata, like sampling site etc. 
+  
+  Here we'll plot a heatmap with pheatmap, and annotate samples based on SITE ID for that sample. Note we're not clustering by column (sample) here, just letting them be plotted in site-order as they appear in the data frame. 
+
+```{r}
+
+
+    #Generate Metadata for Plotting Colours (SITE ID)
+      site_data<-data.frame(Site=sample_data(ps_rare_top50)$SITE)
+      rownames(site_data)<-rownames(sample_data(ps_rare_top50))
+    #Strip Out OTU_Table
+       ps_rare_top50_otu<-otu_table(ps_rare_top50)
+    
+    #Plot Heatmap - No Explicit Clustering 
+      pheatmap(ps_rare_top50_otu,cluster_cols = FALSE,scale="row",annotation_col = site_data)
+```
+
+Now cluster columns by similarity
+```{r}
+    #As Above, But Order Columns (Samples) by Similarity  
+      pheatmap(ps_rare_top50_otu,cluster_cols = TRUE,scale="row",annotation_col = site_data)
+```
+
+Now force ordering by SITE. 
+```{r}
+    #And Again, but for Site Ordering
+      ps_rare_top50_otu_siteorder<-ps_rare_top50_otu[,order(site_data$Site)]
+      pheatmap(ps_rare_top50_otu_siteorder,cluster_cols = FALSE,scale="row",annotation_col = site_data)
+```
+
+## ORDINATIONS
+It can be useful to visualize microbial community structure rather than rely on a matrix of numbers. There are many ways to do so, all with jazzy acronyms, including Non-Metric Multidimensional Scaling (NMDS), Principal Coordinates Analysis (PCoA), Constrained Correspondence Analysis (CCA), Detrended Correspondence Analysis (DCA) etc. They each make different assumptions about the data, but they share the same principle of reducing variation in the relative abundances hundreds of microbial taxa into 2 or 3 axes that can then be plotted/visualised, or statistically tested. 
+  
+  
+  For an excellent guide to the pros and cons of all of these methods, see [this paper by Paliy & Shankar](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4769650/pdf/nihms752912.pdf)
+  
+### Non-Metric Multidimensional Scaling (NMDS) Ordination
+Here we'll use the built in phyloseq functions to perform NMDS ordination on Bray-Curtis distances among samples. We specify 'k=2' to state that the variation should be condensed into 2 axes. 
+
+  <br>
+  As a general rule, the 'stress' value of an NMDS ordination should be below 15% / 0.15, and ideally below 10%. Stress is a measure of how 'easy' it was to reduce the variation in your microbial abundance matrix into the number of axes you specify. If the stress value is too large, or the model doesn't converge, then try setting k to 3. If you do this, make sure to state in your methods of your paper that the ordination was done across 3 axes. 
+  
+  A great tutorial on [NMDS and Stress here](https://jonlefcheck.net/2012/10/24/nmds-tutorial-in-r/)
+  
+```{r}
+####### NMDS ORDINATION
+twosite_ord_NMDS <- phyloseq::ordinate(ps_rare, method = "NMDS",distance="bray")
+phyloseq::plot_ordination(ps_rare, twosite_ord_NMDS, type="samples", color="SITE") + geom_point(size=5)
+gg_ordiplot(twosite_ord_NMDS,sample_data(ps_rare)$SITE,spiders = TRUE,ellipse = T)
+```
+
+
+### Unweighted UNIFRAC
+An alternative to Bray-Curtis distances among samples is to use the Unifrac distance. Unifrac takes into account the phylogenetic relatedness amongst community members using a sequence tree built from your sequences. 'Unweighted' unifrac simply uses genetic distance, whereas 'Weighted' unifrac takes into account the relative abundance of each microbial taxon using the abundance table 
+
+
+```{r}
+####### UNWEIGHTED UNIFRAC ORDINATION
+#Calculate UW UNIFRAC
+  twosite_ord_unifrac_uw <- phyloseq::ordinate(ps_rare, method = "PCoA",distance="unifrac",weighted=FALSE)
+#Base Phyloseq Plot
+  #phyloseq::plot_ordination(ps_rare, twosite_ord_unifrac_uw, type="samples", color="SITE")+ geom_point(size=5)
+#Prettier Plot (note different syntax)  
+  gg_ordiplot(twosite_ord_unifrac_uw$vectors,groups=sample_data(ps_rare)$SITE,spider=T)
+```
+
+### Weighted UNIFRAC
+```{r}
+####### WEIGHTED UNIFRAC ORDINATION
+
+
+#Calculate W UNIFRAC
+  twosite_ord_unifrac_w <- phyloseq::ordinate(ps_rare, method = "PCoA",distance="unifrac",weighted=TRUE)
+#Base Phyloseq Plot
+  #phyloseq::plot_ordination(ps_rare, twosite_ord_unifrac_w, type="samples", color="SITE")+ geom_point(size=5)
+#Prettier Plot (note different syntax)  
+  gg_ordiplot(twosite_ord_unifrac_w$vectors,groups=sample_data(ps_rare)$SITE,spider=T)
+
+```
+
+### Centred Log-Ratio Transformation - No Rarefying!
+
+```{r}
+
+#CLR TRANSFORM
+  ps_clr<-microbiome::transform(ps_clean_samples, 'clr')
+
+#Ordinate
+  ord_clr <- phyloseq::ordinate(ps_clr, "RDA")
+  
+#Plot with Phyloseq  
+  phyloseq::plot_ordination(ps_clr, ord_clr, type="samples", color="SITE")
+
+#GG Version
+  gg_ordiplot(ord_clr,sample_data(ps_clr)$SITE,spiders = TRUE,ellipse = T)
+```
+
+## PERMANOVA: Statistical Testing of Beta DIversity
+PERMANOVA is a randomisation procedure that will test for the effects of predictors of interest in driving differences in beta diversity / community structure. It runs in vegan, so we need the files we converted for vegan. 'soil.v' is our ASV abundance matrix, and the 'data' argument needs our sample metadata.
+
+ The nice thing about PERMANOVA is that it provides r2 values for effects as well as p values, so you can get an idea of % of explained variance and 'importance' of effects.
+ 
+ We can _only use categorical predictors_ in PERMANOVA, so instead of infection load, lets see if microbial community structure varies based on whether individuals died from their Bd infections. 
+ 
+### Getting the Data Ready 
+```{r}
+## 3.4 Statistical Testing Using PERMANOVA
+
+#Function to Extract the Data from phyloseq in a format vegan can understand
+        vegan_otu <- function(physeq) {
+          OTU <- otu_table(physeq)
+          if (taxa_are_rows(OTU)) {
+            OTU <- t(OTU)
+          }
+          return(as(OTU, "matrix"))
+        }
+        
+       
+      #Convert OTU table to abundance matrix
+        frog.v<-vegan_otu(ps_rare)
+        
+        #Convert Sample Data to     
+        frog.s<-as(sample_data(ps_rare),"data.frame")
+
+```
+
+### PERMANOVA of SITE ID and Mortality
+```{r}
+
+    ######################### TESTING FOR DIFFERENCES WITH PERMANOVA 
+        frog.adonis<-adonis2(frog.v ~ SITE + mortality  ,data=frog.s,permutations=10000,method="bray")
+        frog.adonis 
+      
+```
+
+## Network Approaches
+Network analysis allows us to visualise co-occurrence of microbial taxa, or similarity of samples based on microbial community profiles. 
+
+Samples closer together in the network have more similar community structures - i.e. share a higher number of common ASVs. We are using _Jaccard_ distance here, which only accounts for presence/absence, not abundances of ASVs. Values near 1 mean very DISSIMILAR, whereas values near 0 mean very similar (small distance between them). We can make our cutoff more stringent by changing the 'max.dist' variable. 
+
+```{r}
+################# NETWORKS
+
+ig <- make_network(ps_rare, "samples", distance = "jaccard", max.dist = 0.95)
+plot_network(ig, ps_rare, type="samples", point_size = 5, label=NULL, color="SITE", line_alpha = 0.05)
+```
